@@ -43,6 +43,24 @@ import org.opensearch.replication.action.status.TranportShardsInfoAction
 import org.opensearch.replication.action.status.TransportReplicationStatusAction
 import org.opensearch.replication.action.stop.TransportStopIndexReplicationAction
 import org.opensearch.replication.action.stop.TransportInternalStopIndexReplicationAction
+import org.opensearch.replication.action.switchover.FenceIndexAction
+import org.opensearch.replication.action.switchover.FlushAndGetHandoffCheckpointAction
+import org.opensearch.replication.action.switchover.FlushAndGetHandoffCheckpointShardAction
+import org.opensearch.replication.action.switchover.TransportFenceIndexAction
+import org.opensearch.replication.action.switchover.TransportFlushAndGetHandoffCheckpointAction
+import org.opensearch.replication.action.switchover.TransportFlushAndGetHandoffCheckpointShardAction
+import org.opensearch.replication.action.switchover.DemoteIndexAction
+import org.opensearch.replication.action.switchover.FinalizePromoteAction
+import org.opensearch.replication.action.switchover.PromoteIndexAction
+import org.opensearch.replication.action.switchover.PromoteShardAction
+import org.opensearch.replication.action.switchover.TransportDemoteIndexAction
+import org.opensearch.replication.action.switchover.TransportFinalizePromoteAction
+import org.opensearch.replication.action.switchover.TransportPromoteIndexAction
+import org.opensearch.replication.action.switchover.TransportPromoteShardAction
+import org.opensearch.replication.action.switchover.TransportVerifyCaughtUpAction
+import org.opensearch.replication.action.switchover.TransportVerifyCaughtUpShardAction
+import org.opensearch.replication.action.switchover.VerifyCaughtUpAction
+import org.opensearch.replication.action.switchover.VerifyCaughtUpShardAction
 import org.opensearch.replication.action.update.TransportUpdateIndexReplicationAction
 import org.opensearch.replication.action.update.UpdateIndexReplicationAction
 import org.opensearch.replication.metadata.ReplicationMetadataManager
@@ -54,10 +72,15 @@ import org.opensearch.replication.repository.REMOTE_REPOSITORY_TYPE
 import org.opensearch.replication.repository.RemoteClusterRepositoriesService
 import org.opensearch.replication.repository.RemoteClusterRepository
 import org.opensearch.replication.repository.RemoteClusterRestoreLeaderService
+import org.opensearch.replication.rest.FenceIndexHandler
 import org.opensearch.replication.rest.PauseIndexReplicationHandler
 import org.opensearch.replication.rest.ReplicateIndexHandler
 import org.opensearch.replication.rest.ReplicationStatusHandler
 import org.opensearch.replication.rest.ResumeIndexReplicationHandler
+import org.opensearch.replication.rest.DemoteIndexHandler
+import org.opensearch.replication.rest.FlushAndGetHandoffCheckpointHandler
+import org.opensearch.replication.rest.PromoteIndexHandler
+import org.opensearch.replication.rest.VerifyCaughtUpHandler
 import org.opensearch.replication.rest.StopIndexReplicationHandler
 import org.opensearch.replication.rest.UpdateAutoFollowPatternsHandler
 import org.opensearch.replication.rest.UpdateIndexHandler
@@ -161,6 +184,7 @@ internal class ReplicationPlugin : Plugin(), ActionPlugin, PersistentTaskPlugin,
     private lateinit var replicationMetadataManager: ReplicationMetadataManager
     private lateinit var replicationSettings: ReplicationSettings
     private var followerClusterStats = FollowerClusterStats()
+    private val switchoverRoleRegistry = org.opensearch.replication.action.switchover.SwitchoverRoleRegistry()
 
     companion object {
         const val KNN_INDEX_SETTING = "index.knn"
@@ -225,7 +249,7 @@ internal class ReplicationPlugin : Plugin(), ActionPlugin, PersistentTaskPlugin,
         this.replicationMetadataManager = ReplicationMetadataManager(clusterService, client,
                 ReplicationMetadataStore(client, clusterService, xContentRegistry))
         this.replicationSettings = ReplicationSettings(clusterService)
-        return listOf(RemoteClusterRepositoriesService(repositoriesService, clusterService), replicationMetadataManager, replicationSettings, followerClusterStats)
+        return listOf(RemoteClusterRepositoriesService(repositoriesService, clusterService), replicationMetadataManager, replicationSettings, followerClusterStats, switchoverRoleRegistry)
     }
 
     override fun getGuiceServiceClasses(): Collection<Class<out LifecycleComponent>> {
@@ -257,7 +281,16 @@ internal class ReplicationPlugin : Plugin(), ActionPlugin, PersistentTaskPlugin,
             ActionHandler(ReplicationStatusAction.INSTANCE,TransportReplicationStatusAction::class.java),
             ActionHandler(LeaderStatsAction.INSTANCE, TransportLeaderStatsAction::class.java),
             ActionHandler(FollowerStatsAction.INSTANCE, TransportFollowerStatsAction::class.java),
-            ActionHandler(AutoFollowStatsAction.INSTANCE, TransportAutoFollowStatsAction::class.java)
+            ActionHandler(AutoFollowStatsAction.INSTANCE, TransportAutoFollowStatsAction::class.java),
+            ActionHandler(FenceIndexAction.INSTANCE, TransportFenceIndexAction::class.java),
+            ActionHandler(FlushAndGetHandoffCheckpointAction.INSTANCE, TransportFlushAndGetHandoffCheckpointAction::class.java),
+            ActionHandler(FlushAndGetHandoffCheckpointShardAction.INSTANCE, TransportFlushAndGetHandoffCheckpointShardAction::class.java),
+            ActionHandler(VerifyCaughtUpAction.INSTANCE, TransportVerifyCaughtUpAction::class.java),
+            ActionHandler(VerifyCaughtUpShardAction.INSTANCE, TransportVerifyCaughtUpShardAction::class.java),
+            ActionHandler(PromoteIndexAction.INSTANCE, TransportPromoteIndexAction::class.java),
+            ActionHandler(PromoteShardAction.INSTANCE, TransportPromoteShardAction::class.java),
+            ActionHandler(FinalizePromoteAction.INSTANCE, TransportFinalizePromoteAction::class.java),
+            ActionHandler(DemoteIndexAction.INSTANCE, TransportDemoteIndexAction::class.java)
         )
     }
 
@@ -275,7 +308,12 @@ internal class ReplicationPlugin : Plugin(), ActionPlugin, PersistentTaskPlugin,
             ReplicationStatusHandler(),
             LeaderStatsHandler(),
             FollowerStatsHandler(),
-            AutoFollowStatsHandler())
+            AutoFollowStatsHandler(),
+            FenceIndexHandler(),
+            FlushAndGetHandoffCheckpointHandler(),
+            VerifyCaughtUpHandler(),
+            PromoteIndexHandler(),
+            DemoteIndexHandler())
     }
 
     override fun getExecutorBuilders(settings: Settings): List<ExecutorBuilder<*>> {
@@ -382,11 +420,16 @@ internal class ReplicationPlugin : Plugin(), ActionPlugin, PersistentTaskPlugin,
     override fun getEngineFactory(indexSettings: IndexSettings): Optional<EngineFactory> {
         return if (indexSettings.settings.get(REPLICATED_INDEX_SETTING.key) != null) {
             Optional.of(EngineFactory { config ->
-                // Use NRTSegmentReplicationEngine for SEGMENT replication type indices replica shards
-                if (config.isReadOnlyReplica) {
-                    NRTReplicationEngine(config)
-                } else {
-                    ReplicationEngine(config)
+                // Switchover: the promote path sets the per-shard role to LEADER before
+                // triggering resetToWriteableEngine. Honor that override here so the new
+                // engine is write-capable; the index setting still says the index is
+                // replicated, but this shard is now operating as the leader.
+                val override = switchoverRoleRegistry.get(config.shardId)
+                when {
+                    override == org.opensearch.replication.action.switchover.SwitchoverRole.LEADER ->
+                        org.opensearch.index.engine.InternalEngine(config)
+                    config.isReadOnlyReplica -> NRTReplicationEngine(config)
+                    else -> ReplicationEngine(config)
                 }
             })
         } else {
@@ -410,6 +453,9 @@ internal class ReplicationPlugin : Plugin(), ActionPlugin, PersistentTaskPlugin,
         super.onIndexModule(indexModule)
         if (indexModule.settings.get(REPLICATED_INDEX_SETTING.key) != null) {
             indexModule.addIndexEventListener(IndexCloseListener)
+            indexModule.addIndexEventListener(
+                org.opensearch.replication.action.switchover.SwitchoverRoleRegistryCloseListener(switchoverRoleRegistry)
+            )
         }
     }
     override fun getSystemIndexDescriptors(settings: Settings): Collection<SystemIndexDescriptor> {

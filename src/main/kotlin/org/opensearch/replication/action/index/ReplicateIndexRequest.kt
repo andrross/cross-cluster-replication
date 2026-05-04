@@ -143,7 +143,6 @@ class ReplicateIndexRequest : AcknowledgedRequest<ReplicateIndexRequest>, Indice
         waitForRestore = inp.readBoolean()
         isAutoFollowRequest = inp.readBoolean()
         settings = Settings.readSettingsFromStream(inp)
-
     }
 
     override fun writeTo(out: StreamOutput) {
