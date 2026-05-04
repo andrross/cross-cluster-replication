@@ -45,8 +45,13 @@ import org.opensearch.common.settings.IndexScopedSettings
 import org.opensearch.index.IndexNotFoundException
 import org.opensearch.persistent.PersistentTasksService
 import org.opensearch.replication.ReplicationPlugin
+import org.opensearch.replication.metadata.INDEX_REPLICATION_BLOCK
 import org.opensearch.replication.util.stackTraceToString
+import org.opensearch.replication.util.suspendExecute
 import org.opensearch.repositories.RepositoriesService
+import org.opensearch.core.index.shard.ShardId
+import org.opensearch.index.seqno.RetentionLeaseActions
+import org.opensearch.index.seqno.RetentionLeaseAlreadyExistsException
 import org.opensearch.core.rest.RestStatus
 import org.opensearch.threadpool.ThreadPool
 import org.opensearch.transport.TransportService
@@ -101,7 +106,25 @@ class TransportReplicateIndexClusterManagerNodeAction @Inject constructor(transp
                 val remoteMetadata = getRemoteIndexMetadata(replicateIndexReq.leaderAlias, replicateIndexReq.leaderIndex)
                 log.debug("Response returned of the request made to get metadata of ${replicateIndexReq.leaderIndex} index on remote cluster")
 
-                if (state.routingTable.hasIndex(replicateIndexReq.followerIndex)) {
+                // Three possible states of the follower index, detected from cluster state:
+                //   1. Doesn't exist          → normal bootstrap path (snapshot restore).
+                //   2. Exists in follower shape (REPLICATED_INDEX_SETTING + CCR block)
+                //                             → resume path; skip bootstrap and establish
+                //                               retention leases at seqno 0.
+                //   3. Exists but not in follower shape → reject. Either this is a plain
+                //                               index the caller should delete first, or a
+                //                               half-broken state from a failed _stop.
+                //
+                // The downstream IndexReplicationTask's isResumed() check (which is true
+                // whenever the follower index already exists in routing) handles the
+                // code-path split on its side; here we just gate and prepare.
+                val followerIndexExists = state.routingTable.hasIndex(replicateIndexReq.followerIndex)
+                val isResumableFollower = followerIndexExists &&
+                    state.metadata.index(replicateIndexReq.followerIndex)
+                        ?.settings?.get(ReplicationPlugin.REPLICATED_INDEX_SETTING.key) != null &&
+                    state.blocks.hasIndexBlock(replicateIndexReq.followerIndex, INDEX_REPLICATION_BLOCK)
+
+                if (followerIndexExists && !isResumableFollower) {
                     throw IllegalArgumentException("Cant use same index again for replication. " +
                     "Delete the index:${replicateIndexReq.followerIndex}")
                 }
@@ -109,6 +132,22 @@ class TransportReplicateIndexClusterManagerNodeAction @Inject constructor(transp
                 indexScopedSettings.validate(replicateIndexReq.settings,
                         false,
                         false)
+
+                if (isResumableFollower) {
+                    // Bootstrap would normally establish the retention lease on each
+                    // leader shard via RemoteClusterRestoreLeaderService. Resuming against
+                    // an already-demoted follower skips bootstrap, so no lease exists and
+                    // the first renewRetentionLease from the shard task would fail. Add
+                    // the leases here at seqno 0; the shard task renews them forward on
+                    // its first cycle.
+                    log.info("Follower index ${replicateIndexReq.followerIndex} already exists " +
+                        "in follower shape; skipping bootstrap and establishing retention leases")
+                    establishInitialRetentionLeases(
+                        replicateIndexReq.leaderAlias,
+                        remoteMetadata.index,
+                        replicateIndexReq.followerIndex
+                    )
+                }
 
                 val params = IndexReplicationParams(replicateIndexReq.leaderAlias, remoteMetadata.index, replicateIndexReq.followerIndex)
 
@@ -139,6 +178,56 @@ class TransportReplicateIndexClusterManagerNodeAction @Inject constructor(transp
             } catch (e: Exception) {
                 log.error("Failed to trigger replication for ${replicateIndexReq.followerIndex} - ${e.stackTraceToString()}")
                 listener.onFailure(e)
+            }
+        }
+    }
+
+    /**
+     * Establish initial retention leases on each leader shard so the shard-level pull
+     * task's first renew call succeeds. Uses seqno 0 as the starting position; the task
+     * will renew forward to the actual local checkpoint on its first cycle.
+     *
+     * Called only on the skip-bootstrap path. The normal bootstrap path does this inside
+     * the snapshot-restore flow.
+     */
+    private suspend fun establishInitialRetentionLeases(
+        leaderAlias: String,
+        leaderIndex: org.opensearch.core.index.Index,
+        followerIndex: String
+    ) {
+        val remoteClient = nodeClient.getRemoteClusterClient(leaderAlias)
+        val followerRouting = clusterService.state().routingTable.index(followerIndex)
+            ?: throw IllegalStateException("Follower index $followerIndex has no routing")
+        // Retention lease ID format matches what ShardReplicationTask / RemoteClusterRetentionLeaseHelper
+        // use when it later renews: "replication:<follower-cluster>:<follower-uuid>:<follower-shard>".
+        val followerClusterNameWithUUID =
+            "${clusterService.clusterName.value()}:${clusterService.state().metadata.clusterUUID()}"
+        val leaseSource = "replication:$followerClusterNameWithUUID"
+        for (shardIdInt in followerRouting.shards().keys) {
+            val followerShardId = followerRouting.shard(shardIdInt).shardId
+            val leaderShardId = ShardId(leaderIndex, shardIdInt)
+            val retentionLeaseId = "$leaseSource:$followerShardId"
+            val addRequest = RetentionLeaseActions.AddRequest(
+                leaderShardId, retentionLeaseId, 0L, leaseSource
+            )
+            try {
+                remoteClient.suspendExecute(RetentionLeaseActions.Add.INSTANCE, addRequest)
+                log.info("Established initial retention lease $retentionLeaseId on leader $leaderAlias:$leaderShardId")
+            } catch (e: Exception) {
+                // The lease may already exist from the prior replication direction —
+                // flips don't currently clean up leases on the former leader. If so,
+                // leave it alone: it's retaining at some seqno from prior replication
+                // (>= 0), which still serves as a valid floor. The shard task's first
+                // renew cycle will advance it forward. Renewing to 0 here would be
+                // rejected, since leases can only move forward.
+                val isAlreadyExists = e is RetentionLeaseAlreadyExistsException ||
+                    e.cause is RetentionLeaseAlreadyExistsException
+                if (!isAlreadyExists) {
+                    log.warn("Failed to establish initial retention lease for $followerShardId " +
+                        "against leader $leaderAlias:$leaderShardId: ${e.message}")
+                    throw e
+                }
+                log.info("Retention lease $retentionLeaseId already exists on $leaderAlias:$leaderShardId — leaving prior lease in place (will be renewed forward by shard task)")
             }
         }
     }
