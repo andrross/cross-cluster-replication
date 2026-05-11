@@ -189,7 +189,7 @@ curl -sS -XPUT "http://$B/_plugins/_replication/$INDEX_NAME/_start?wait_for_rest
 step "Phase 1: A is leader. Indexing 20 docs on A."
 for i in $(seq 1 20); do
   curl -sS -XPOST "http://$A/$INDEX_NAME/_doc" -H 'Content-Type: application/json' \
-    -d "{\"n\":$i,\"phase\":\"initial\"}" > /dev/null
+    -d "{\"n\":$i,\"phase\":\"initial\",\"endpoint\":\"http://$A\"}" > /dev/null
 done
 curl -sS -XPOST "http://$A/$INDEX_NAME/_refresh" > /dev/null
 
@@ -257,7 +257,7 @@ flip "$A" "$B" "A" "B" "$CONN_B_TO_A"
 step "Phase 2: B is leader. Indexing 10 more docs on B."
 for i in $(seq 21 30); do
   curl -sS -XPOST "http://$B/$INDEX_NAME/_doc" -H 'Content-Type: application/json' \
-    -d "{\"n\":$i,\"phase\":\"after_flip_1\"}" > /dev/null
+    -d "{\"n\":$i,\"phase\":\"after_flip_1\",\"endpoint\":\"http://$B\"}" > /dev/null
 done
 curl -sS -XPOST "http://$B/$INDEX_NAME/_refresh" > /dev/null
 
@@ -272,6 +272,8 @@ curl -sS -XPOST "http://$A/$INDEX_NAME/_refresh" > /dev/null
 cluster_state_summary "$A" "A"
 cluster_state_summary "$B" "B"
 
+confirm_continue "Ready to flip direction B→A ⇒ A→B"
+
 # ----- flip #2: B→A becomes A→B -------------------------------------------
 
 flip "$B" "$A" "B" "A" "$CONN_A_TO_B"
@@ -281,7 +283,7 @@ flip "$B" "$A" "B" "A" "$CONN_A_TO_B"
 step "Phase 3: A is leader again. Indexing 5 more docs on A."
 for i in $(seq 31 35); do
   curl -sS -XPOST "http://$A/$INDEX_NAME/_doc" -H 'Content-Type: application/json' \
-    -d "{\"n\":$i,\"phase\":\"after_flip_2\"}" > /dev/null
+    -d "{\"n\":$i,\"phase\":\"after_flip_2\",\"endpoint\":\"http://$A\"}" > /dev/null
 done
 curl -sS -XPOST "http://$A/$INDEX_NAME/_refresh" > /dev/null
 

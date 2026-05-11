@@ -95,6 +95,13 @@ import org.opensearch.replication.task.shard.ShardReplicationExecutor
 import org.opensearch.replication.task.shard.ShardReplicationParams
 import org.opensearch.replication.task.shard.ShardReplicationState
 import org.opensearch.replication.util.Injectables
+import org.opensearch.replication.v2.MetadataReplicationController
+import org.opensearch.replication.v2.ReplicationIntent
+import org.opensearch.replication.v2.action.PutReplicationIntentAction
+import org.opensearch.replication.v2.action.TransportPutReplicationIntentAction
+import org.opensearch.replication.v2.metadata.handlers.CoreHandlers
+import org.opensearch.replication.v2.reconciler.PerNodeReconciler
+import org.opensearch.replication.rest.PutReplicationIntentHandler
 import org.opensearch.action.ActionRequest
 import org.opensearch.core.action.ActionResponse
 import org.opensearch.transport.client.Client
@@ -249,7 +256,24 @@ internal class ReplicationPlugin : Plugin(), ActionPlugin, PersistentTaskPlugin,
         this.replicationMetadataManager = ReplicationMetadataManager(clusterService, client,
                 ReplicationMetadataStore(client, clusterService, xContentRegistry))
         this.replicationSettings = ReplicationSettings(clusterService)
-        return listOf(RemoteClusterRepositoriesService(repositoriesService, clusterService), replicationMetadataManager, replicationSettings, followerClusterStats, switchoverRoleRegistry)
+
+        val v2MetadataController = MetadataReplicationController(
+            clusterService,
+            client,
+            CoreHandlers.defaultRegistry(client),
+            replicationMetadataManager
+        )
+        val v2Reconciler = PerNodeReconciler(clusterService, client, threadPool)
+
+        return listOf(
+            RemoteClusterRepositoriesService(repositoriesService, clusterService),
+            replicationMetadataManager,
+            replicationSettings,
+            followerClusterStats,
+            switchoverRoleRegistry,
+            v2MetadataController,
+            v2Reconciler
+        )
     }
 
     override fun getGuiceServiceClasses(): Collection<Class<out LifecycleComponent>> {
@@ -290,7 +314,8 @@ internal class ReplicationPlugin : Plugin(), ActionPlugin, PersistentTaskPlugin,
             ActionHandler(PromoteIndexAction.INSTANCE, TransportPromoteIndexAction::class.java),
             ActionHandler(PromoteShardAction.INSTANCE, TransportPromoteShardAction::class.java),
             ActionHandler(FinalizePromoteAction.INSTANCE, TransportFinalizePromoteAction::class.java),
-            ActionHandler(DemoteIndexAction.INSTANCE, TransportDemoteIndexAction::class.java)
+            ActionHandler(DemoteIndexAction.INSTANCE, TransportDemoteIndexAction::class.java),
+            ActionHandler(PutReplicationIntentAction.INSTANCE, TransportPutReplicationIntentAction::class.java)
         )
     }
 
@@ -313,7 +338,8 @@ internal class ReplicationPlugin : Plugin(), ActionPlugin, PersistentTaskPlugin,
             FlushAndGetHandoffCheckpointHandler(),
             VerifyCaughtUpHandler(),
             PromoteIndexHandler(),
-            DemoteIndexHandler())
+            DemoteIndexHandler(),
+            PutReplicationIntentHandler())
     }
 
     override fun getExecutorBuilders(settings: Settings): List<ExecutorBuilder<*>> {
@@ -372,6 +398,10 @@ internal class ReplicationPlugin : Plugin(), ActionPlugin, PersistentTaskPlugin,
                 Writeable.Reader { inp -> ReplicationStateMetadata(inp) }),
             NamedWriteableRegistry.Entry(NamedDiff::class.java, ReplicationStateMetadata.NAME,
                 Writeable.Reader { inp -> ReplicationStateMetadata.Diff(inp) }),
+            NamedWriteableRegistry.Entry(Metadata.Custom::class.java, ReplicationIntent.NAME,
+                Writeable.Reader { inp -> ReplicationIntent(inp) }),
+            NamedWriteableRegistry.Entry(NamedDiff::class.java, ReplicationIntent.NAME,
+                Writeable.Reader { inp -> ReplicationIntent.readDiffFrom(inp) }),
             NamedWriteableRegistry.Entry(Task.Status::class.java, AutoFollowStat.NAME,
                     Writeable.Reader { inp -> AutoFollowStat(inp) })
         )
@@ -396,7 +426,10 @@ internal class ReplicationPlugin : Plugin(), ActionPlugin, PersistentTaskPlugin,
                     CheckedFunction { parser: XContentParser -> AutoFollowParams.fromXContent(parser)}),
             NamedXContentRegistry.Entry(Metadata.Custom::class.java,
                     ParseField(ReplicationStateMetadata.NAME),
-                    CheckedFunction { parser: XContentParser -> ReplicationStateMetadata.fromXContent(parser)})
+                    CheckedFunction { parser: XContentParser -> ReplicationStateMetadata.fromXContent(parser)}),
+            NamedXContentRegistry.Entry(Metadata.Custom::class.java,
+                    ParseField(ReplicationIntent.NAME),
+                    CheckedFunction { parser: XContentParser -> ReplicationIntent.fromXContent(parser)})
         )
     }
 
