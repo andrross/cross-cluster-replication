@@ -25,17 +25,28 @@ import java.util.EnumSet
 /**
  * Cluster-scoped declarative intent for full-cluster replication.
  *
- * Lives in cluster state as a Metadata.Custom. The external control plane writes the stable
- * fields (peer, role). In-cluster workflows write the transitional fields (status, epoch)
- * during switchover/failover. Everything else in the cluster is a reader.
+ * Lives in cluster state as a Metadata.Custom. The external control plane chooses the
+ * relationship ID; both clusters record the same ID and the same pair of aliases. Only the
+ * role differs between the two sides.
  *
  * Scope: every user index is replicated. There is no replicated_indices list on this
  * document — which indices are in scope is computed from local cluster state via
  * ReplicationScope.isReplicable(). A future exclude-patterns extension would add a field
  * here and layer on that predicate without changing call sites.
+ *
+ * Field semantics:
+ *   - relationshipId — caller-chosen, stable across the life of the relationship.
+ *   - localAlias — this cluster's label (usually its region / deployment name).
+ *   - remoteAlias — the peer cluster's label. On the SECONDARY this must match an existing
+ *     `cluster.remote.<remoteAlias>` setting; on the PRIMARY it is cosmetic.
+ *   - role — PRIMARY or SECONDARY. Flips on switchover or failover.
+ *   - status — STEADY, SWITCHING, or FAILED_OVER.
+ *   - epoch — relationship-generation counter. Bumps exactly once per role flip.
  */
 data class ReplicationIntent(
-    val peerClusterAlias: String,
+    val relationshipId: String,
+    val localAlias: String,
+    val remoteAlias: String,
     val role: Role,
     val epoch: Long,
     val status: Status
@@ -43,12 +54,14 @@ data class ReplicationIntent(
 
     enum class Role { PRIMARY, SECONDARY }
 
-    enum class Status { STEADY, SWITCHING, FAILING_OVER, FAILED_BACK, ABORTED }
+    enum class Status { STEADY, SWITCHING, FAILED_OVER }
 
     companion object {
         const val NAME = "replication_intent"
 
-        private const val FIELD_PEER = "peer_cluster"
+        private const val FIELD_RELATIONSHIP_ID = "relationship_id"
+        private const val FIELD_LOCAL_ALIAS = "local_alias"
+        private const val FIELD_REMOTE_ALIAS = "remote_alias"
         private const val FIELD_ROLE = "role"
         private const val FIELD_EPOCH = "epoch"
         private const val FIELD_STATUS = "status"
@@ -57,7 +70,9 @@ data class ReplicationIntent(
             readDiffFrom(Metadata.Custom::class.java, NAME, inp)
 
         fun fromXContent(parser: XContentParser): ReplicationIntent {
-            var peer: String? = null
+            var relationshipId: String? = null
+            var localAlias: String? = null
+            var remoteAlias: String? = null
             var role: Role? = null
             var epoch: Long = 0L
             var status: Status = Status.STEADY
@@ -72,28 +87,34 @@ data class ReplicationIntent(
                 if (token == XContentParser.Token.FIELD_NAME) {
                     currentField = parser.currentName()
                 } else when (currentField) {
-                    FIELD_PEER -> peer = parser.text()
+                    FIELD_RELATIONSHIP_ID -> relationshipId = parser.text()
+                    FIELD_LOCAL_ALIAS -> localAlias = parser.text()
+                    FIELD_REMOTE_ALIAS -> remoteAlias = parser.text()
                     FIELD_ROLE -> role = Role.valueOf(parser.text().uppercase())
                     FIELD_EPOCH -> epoch = parser.longValue()
                     FIELD_STATUS -> status = Status.valueOf(parser.text().uppercase())
                 }
             }
-            require(peer != null && role != null) {
-                "replication intent requires $FIELD_PEER and $FIELD_ROLE"
+            require(relationshipId != null && localAlias != null && remoteAlias != null && role != null) {
+                "replication intent requires $FIELD_RELATIONSHIP_ID, $FIELD_LOCAL_ALIAS, $FIELD_REMOTE_ALIAS, $FIELD_ROLE"
             }
-            return ReplicationIntent(peer, role, epoch, status)
+            return ReplicationIntent(relationshipId, localAlias, remoteAlias, role, epoch, status)
         }
     }
 
     constructor(inp: StreamInput) : this(
-        peerClusterAlias = inp.readString(),
+        relationshipId = inp.readString(),
+        localAlias = inp.readString(),
+        remoteAlias = inp.readString(),
         role = Role.valueOf(inp.readString()),
         epoch = inp.readLong(),
         status = Status.valueOf(inp.readString())
     )
 
     override fun writeTo(out: StreamOutput) {
-        out.writeString(peerClusterAlias)
+        out.writeString(relationshipId)
+        out.writeString(localAlias)
+        out.writeString(remoteAlias)
         out.writeString(role.name)
         out.writeLong(epoch)
         out.writeString(status.name)
@@ -104,7 +125,9 @@ data class ReplicationIntent(
     override fun getMinimalSupportedVersion(): Version = Version.V_2_0_0
 
     override fun toXContent(builder: XContentBuilder, params: ToXContent.Params): XContentBuilder {
-        builder.field(FIELD_PEER, peerClusterAlias)
+        builder.field(FIELD_RELATIONSHIP_ID, relationshipId)
+        builder.field(FIELD_LOCAL_ALIAS, localAlias)
+        builder.field(FIELD_REMOTE_ALIAS, remoteAlias)
         builder.field(FIELD_ROLE, role.name)
         builder.field(FIELD_EPOCH, epoch)
         builder.field(FIELD_STATUS, status.name)

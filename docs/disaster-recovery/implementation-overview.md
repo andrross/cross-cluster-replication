@@ -3,33 +3,57 @@
 
 ## API surface
 
-The intent document is a `Metadata.Custom` in cluster state (could be system index too).
+The intent document is a `Metadata.Custom` in cluster state (could be a system index too).
+
+The URL parameter is a customer-chosen **relationship ID**. It identifies the
+replication relationship and is stable across its life. Both clusters record the
+same ID.
 
 ```
-PUT /_replication/cluster/<peer-alias>
+PUT /_replication/cluster/<relationship-id>
 {
-"role": "PRIMARY" | "SECONDARY"
+  "role": "SECONDARY",
+  "local_alias": "us-east-1",
+  "remote_alias": "us-west-2"
 }
 ```
 
+The PUT is issued against the SECONDARY. It:
+1. Verifies `cluster.remote.<remote_alias>.seeds` is configured.
+2. Issues an internal transport action to the peer cluster via that connection,
+   asking it to install its side of the relationship with `role=PRIMARY` and
+   the two aliases swapped.
+3. On ack, writes its own intent locally.
+
+The primary-side install is idempotent: re-issuing for the same relationship ID
+is a no-op. A different, conflicting relationship ID returns 409.
+
 ```
-GET /_replication/cluster/<peer-alias>
+GET /_replication/cluster/<relationship-id>
 → {
-"peer_cluster_alias": "...",
-"role": "...",
-"epoch": N,
-"status": "STEADY",
-"last_applied_metadata_version": N,
-"lag_seconds": N,
-...
+  "relationship_id": "us-west-east-dr",
+  "role": "PRIMARY" | "SECONDARY",
+  "local_alias": "...",
+  "remote_alias": "...",
+  "epoch": N,
+  "status": "STEADY"
 }
 ```
 
 ```
-DELETE /_replication/cluster/<peer-alias>
+DELETE /_replication/cluster/<relationship-id>
 ```
 
-The handler is a `TransportClusterManagerNodeAction` that submits an `AckedClusterStateUpdateTask` adding or removing replication intent document from `Metadata.customs`. There is no replicated-indices list; scope is "all user indices" and relevant system indices.
+DELETE only affects the cluster it's called on. No cross-cluster coordination.
+Deleting the relationship always returns the local cluster to the state of an
+independent writable cluster. All data is left in place.
+
+Implementation detail: DELETE strips the follower marker
+(`REPLICATED_INDEX_SETTING`) from any previously-replicated indices as part of
+the cleanup. Without this, the reconciler would keep attempting to replicate
+those indices from a peer that no longer has an intent. With the marker
+stripped, the indices become ordinary indices under the local cluster's
+control.
 
 ## Long-poll on leader metadata changes
 
@@ -51,7 +75,7 @@ The primary side is stateless — `ClusterStateAction` is handled by OpenSearch 
 
 Bootstrap iteration omits `waitForMetadataVersion` so the first poll returns immediately with current state. Subsequent iterations long-poll. If the primary's metadata version regresses (restore from snapshot, etc.) the secondary resets to 0 and falls back to the bootstrap path.
 
-The loop is keyed on `(peer, epoch)`. Intent-change → stop + restart with fresh `lastAppliedMetadataVersion = 0`.
+The loop is keyed on `(relationship-id, epoch)`. Intent-change → stop + restart with fresh `lastAppliedMetadataVersion = 0`.
 
 ## Handler pipeline
 
@@ -112,8 +136,6 @@ Data-plane replication after bootstrap runs as in-memory coroutines on data node
 | `ClusterStateAction` (secondary) | Suspended coroutine, no thread parked. Delivered on Netty I/O; we don't do heavy work inline there. |
 
 ## Observability
-
-Cannot rely on `_cat/tasks` to track replication. Will need purpose built APIs for things like:
 
 - cluster replication status: e.g. current intent (peer, role, epoch, status), metadata controller state (running,
   last_applied_metadata_version, peer's current version, lag), shard-worker summary (per node: N running, N dead, N backing-off), bootstrap summary (in-flight

@@ -17,8 +17,16 @@ import org.opensearch.OpenSearchTimeoutException
 import org.opensearch.action.admin.cluster.snapshots.restore.RestoreSnapshotAction
 import org.opensearch.action.admin.cluster.snapshots.restore.RestoreSnapshotRequest
 import org.opensearch.action.admin.cluster.snapshots.restore.RestoreSnapshotResponse
+import org.opensearch.action.admin.indices.close.CloseIndexRequest
 import org.opensearch.action.admin.indices.delete.DeleteIndexRequest
+import org.opensearch.action.admin.indices.open.OpenIndexRequest
+import org.opensearch.action.support.clustermanager.AcknowledgedResponse
+import org.opensearch.cluster.AckedClusterStateUpdateTask
 import org.opensearch.cluster.ClusterState
+import org.opensearch.cluster.ack.AckedRequest
+import org.opensearch.cluster.metadata.IndexMetadata
+import org.opensearch.cluster.metadata.Metadata
+import org.opensearch.replication.util.waitForClusterStateUpdate
 import org.opensearch.cluster.RestoreInProgress
 import org.opensearch.cluster.service.ClusterService
 import org.opensearch.common.settings.Settings
@@ -73,7 +81,7 @@ class BootstrapOrchestrator(
      */
     suspend fun tryBootstrap(intent: ReplicationIntent, primaryState: ClusterState) {
         val localState = clusterService.state()
-        val repoName = RemoteClusterRepository.repoForCluster(intent.peerClusterAlias)
+        val repoName = RemoteClusterRepository.repoForCluster(intent.remoteAlias)
 
         val primaryIndices: Set<String> = primaryState.metadata.indices()
             .values
@@ -97,7 +105,7 @@ class BootstrapOrchestrator(
             }
             if (!inFlight.add(index)) continue
             try {
-                bootstrapOne(intent.peerClusterAlias, repoName, index)
+                bootstrapOne(intent.remoteAlias, repoName, index)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -132,11 +140,21 @@ class BootstrapOrchestrator(
     }
 
     /**
-     * Remove every local follower index. Used when the intent is cleared or the role flips
-     * away from SECONDARY — the relationship is over and the follower data is no longer under
-     * replication management.
+     * Sever the replication relationship on the secondary while preserving data and
+     * configuration. Used when the intent is cleared or the role flips away from SECONDARY —
+     * the relationship is over, but the follower data stays as-is, becoming ordinary
+     * writable indices under the local cluster's control.
+     *
+     * For each previously-replicated index:
+     *   1. close it (so the engine factory re-runs on reopen),
+     *   2. strip REPLICATED_INDEX_SETTING (the marker that makes the engine factory select
+     *      ReplicationEngine / the read-only follower engine),
+     *   3. reopen it (gets a fresh InternalEngine, is writable).
+     *
+     * The .replication-metadata-store doc is also cleaned up so a later re-setup doesn't
+     * collide.
      */
-    suspend fun removeAllFollowerIndices() {
+    suspend fun severFollowerRelationship() {
         val localState = clusterService.state()
         val indices = localState.metadata.indices()
             .values
@@ -146,14 +164,96 @@ class BootstrapOrchestrator(
         for (index in indices) {
             if (!deleteInFlight.add(index)) continue
             try {
-                deleteFollowerIndex(index)
+                severOne(index)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                log.warn("delete (bulk) of {} failed: {}", index, e.message)
+                log.warn("sever of {} failed: {}", index, e.message)
             } finally {
                 deleteInFlight.remove(index)
             }
+        }
+    }
+
+    private suspend fun severOne(indexName: String) {
+        log.info("sever: converting follower index {} to ordinary index", indexName)
+
+        // Close so the next open rebuilds the engine from fresh settings.
+        try {
+            client.suspending(client.admin().indices()::close, defaultContext = true)(
+                CloseIndexRequest(indexName)
+            )
+        } catch (e: org.opensearch.index.IndexNotFoundException) {
+            return
+        }
+
+        // Strip the follower marker. REPLICATED_INDEX_SETTING is InternalIndex, so
+        // UpdateSettingsAction refuses ("managed via a dedicated API"). Bypass that check
+        // by submitting a cluster-state update task that rewrites the IndexMetadata
+        // directly — legitimate because we ARE the dedicated API here.
+        try {
+            stripFollowerMarker(indexName)
+        } catch (e: Exception) {
+            log.warn("sever: failed to strip REPLICATED_INDEX_SETTING from {}: {}",
+                indexName, e.message)
+            // Try to reopen anyway; leaving the index closed is worse than leaving the
+            // setting in place. The engine will still come up as ReplicationEngine (read-only)
+            // but at least the index is accessible.
+        }
+
+        // Reopen — fresh engine, now InternalEngine because the marker is gone.
+        try {
+            client.suspending(client.admin().indices()::open, defaultContext = true)(
+                OpenIndexRequest(indexName)
+            )
+        } catch (e: Exception) {
+            log.warn("sever: failed to reopen {} after severing relationship: {}",
+                indexName, e.message)
+        }
+
+        // Best-effort cleanup of the legacy metadata store doc we wrote during bootstrap.
+        try {
+            replicationMetadataManager.deleteIndexReplicationMetadata(indexName)
+        } catch (e: Exception) {
+            log.debug("sever: replication-metadata-store cleanup for {} failed: {}",
+                indexName, e.message)
+        }
+    }
+
+    private suspend fun stripFollowerMarker(indexName: String) {
+        val ackRequest = object : AckedRequest {
+            override fun ackTimeout(): TimeValue = TimeValue.timeValueSeconds(30)
+            override fun clusterManagerNodeTimeout(): TimeValue = TimeValue.timeValueSeconds(30)
+        }
+        val response: AcknowledgedResponse = clusterService.waitForClusterStateUpdate(
+            "replication-sever[$indexName]"
+        ) { listener ->
+            object : AckedClusterStateUpdateTask<AcknowledgedResponse>(ackRequest, listener) {
+                override fun execute(currentState: ClusterState): ClusterState {
+                    val currentIndexMetadata = currentState.metadata.index(indexName)
+                        ?: return currentState
+                    if (currentIndexMetadata.settings[ReplicationPlugin.REPLICATED_INDEX_SETTING.key] == null) {
+                        return currentState
+                    }
+                    val newIndexMetadata = IndexMetadata.builder(currentIndexMetadata)
+                        .settings(
+                            Settings.builder()
+                                .put(currentIndexMetadata.settings)
+                                .putNull(ReplicationPlugin.REPLICATED_INDEX_SETTING.key)
+                        )
+                        .settingsVersion(1 + currentIndexMetadata.settingsVersion)
+                        .build()
+                    val mdBuilder = Metadata.builder(currentState.metadata).put(newIndexMetadata, false)
+                    return ClusterState.builder(currentState).metadata(mdBuilder).build()
+                }
+
+                override fun newResponse(acknowledged: Boolean): AcknowledgedResponse {
+                    return AcknowledgedResponse(acknowledged)
+                }
+            }
+        }
+        if (!response.isAcknowledged) {
+            throw RuntimeException("strip-marker not acknowledged for $indexName")
         }
     }
 
@@ -174,8 +274,8 @@ class BootstrapOrchestrator(
         }
     }
 
-    private suspend fun bootstrapOne(peerAlias: String, repoName: String, indexName: String) {
-        log.info("bootstrap: restoring {} from peer {} via repo {}", indexName, peerAlias, repoName)
+    private suspend fun bootstrapOne(remoteAlias: String, repoName: String, indexName: String) {
+        log.info("bootstrap: restoring {} from remote {} via repo {}", indexName, remoteAlias, repoName)
 
         // The RemoteClusterRepository's restoreShard path reads per-index ReplicationMetadata
         // from the .replication-metadata-store system index (connection name, leader index,
@@ -183,7 +283,7 @@ class BootstrapOrchestrator(
         try {
             replicationMetadataManager.addIndexReplicationMetadata(
                 followerIndex = indexName,
-                connectionName = peerAlias,
+                connectionName = remoteAlias,
                 leaderIndex = indexName,
                 overallState = ReplicationOverallState.RUNNING,
                 user = null,
@@ -202,7 +302,7 @@ class BootstrapOrchestrator(
         // translog semantics) instead of the default InternalEngine. Without it, ReplayChanges
         // would misbehave against a writable engine.
         val followerIndexSettings = Settings.builder()
-            .put(ReplicationPlugin.REPLICATED_INDEX_SETTING.key, "$peerAlias:$indexName")
+            .put(ReplicationPlugin.REPLICATED_INDEX_SETTING.key, "$remoteAlias:$indexName")
             .build()
 
         val restoreRequest = RestoreSnapshotRequest(repoName, REMOTE_SNAPSHOT_NAME)

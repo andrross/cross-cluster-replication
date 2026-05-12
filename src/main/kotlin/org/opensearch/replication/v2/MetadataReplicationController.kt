@@ -53,12 +53,11 @@ class MetadataReplicationController(
     private val clusterService: ClusterService,
     private val client: Client,
     private val handlerRegistry: CategoryHandlerRegistry,
-    private val replicationMetadataManager: ReplicationMetadataManager
+    private val replicationMetadataManager: ReplicationMetadataManager,
+    private val bootstrap: BootstrapOrchestrator
 ) : AbstractLifecycleComponent(), ClusterStateListener {
 
     private val log = LogManager.getLogger(javaClass)
-
-    private val bootstrap = BootstrapOrchestrator(clusterService, client, replicationMetadataManager)
 
     private val scope = CoroutineScope(
         SupervisorJob() + Dispatchers.Default + CoroutineName("metadata-replication")
@@ -69,7 +68,7 @@ class MetadataReplicationController(
     private var activeLoopKey: LoopKey? = null
 
     /** Key that determines whether the loop should be restarted. */
-    private data class LoopKey(val peer: String, val epoch: Long)
+    private data class LoopKey(val relationshipId: String, val epoch: Long)
 
     @Volatile private var lastAppliedMetadataVersion: Long = 0L
     @Volatile private var quarantineCount: Long = 0L
@@ -104,23 +103,12 @@ class MetadataReplicationController(
         val curr = ReplicationIntent.Reader.from(event.state().metadata)
         if (prev != curr) {
             log.info("replication intent changed: {} -> {}", prev, curr)
-            // SECONDARY relationship ended (cleared or flipped to PRIMARY). Remove any local
-            // follower indices — they're no longer under replication management. Only do
-            // this on the elected cluster manager to avoid every CM-eligible node firing a
-            // concurrent delete sweep.
-            val transitionedAway = prev?.isSecondary == true && curr?.isSecondary != true
-            if (transitionedAway && event.state().nodes().isLocalNodeElectedClusterManager) {
-                scope.launch {
-                    try {
-                        bootstrap.removeAllFollowerIndices()
-                    } catch (e: CancellationException) {
-                        throw e
-                    } catch (e: Exception) {
-                        log.warn("follower-index cleanup on intent transition failed: {}",
-                            e.message)
-                    }
-                }
-            }
+            // NOTE: severing the follower relationship on SECONDARY → not-SECONDARY is driven
+            // by TransportPutReplicationIntentAction (the DELETE handler). It runs sever
+            // synchronously BEFORE clearing the intent so clients never see a window where
+            // the intent is gone but the indices still have REPLICATED_INDEX_SETTING. We
+            // intentionally do NOT fire another sever here — doing so would race with the
+            // DELETE path and could double-close/open indices.
         }
         syncRole()
     }
@@ -149,7 +137,7 @@ class MetadataReplicationController(
     }
 
     private fun ensureLoopForEpoch(intent: ReplicationIntent) {
-        val key = LoopKey(intent.peerClusterAlias, intent.epoch)
+        val key = LoopKey(intent.relationshipId, intent.epoch)
         if (loopJob?.isActive == true && activeLoopKey == key) return
         stopLoop("restarting for $key")
         activeLoopKey = key
@@ -158,9 +146,9 @@ class MetadataReplicationController(
         // saw on a prior relationship, so bootstrap by omitting waitForMetadataVersion on the
         // first iteration.
         lastAppliedMetadataVersion = 0L
-        loopJob = scope.launch { runLoop(intent.peerClusterAlias) }
-        log.info("metadata long-poll loop started (peer={}, epoch={})",
-            intent.peerClusterAlias, intent.epoch)
+        loopJob = scope.launch { runLoop(intent.remoteAlias) }
+        log.info("metadata long-poll loop started (relationship_id={}, remote={}, epoch={})",
+            intent.relationshipId, intent.remoteAlias, intent.epoch)
     }
 
     private fun stopLoop(reason: String) {
@@ -172,12 +160,12 @@ class MetadataReplicationController(
         activeLoopKey = null
     }
 
-    private suspend fun runLoop(peerAlias: String) {
-        val remoteClient = client.getRemoteClusterClient(peerAlias)
+    private suspend fun runLoop(remoteAlias: String) {
+        val remoteClient = client.getRemoteClusterClient(remoteAlias)
 
         while (scope.isActive) {
             val intent = ReplicationIntent.Reader.from(clusterService.state().metadata)
-            if (intent == null || intent.peerClusterAlias != peerAlias || !intent.isSecondary) {
+            if (intent == null || intent.remoteAlias != remoteAlias || !intent.isSecondary) {
                 log.info("loop stopping: intent changed under us ({})", intent)
                 return
             }
@@ -203,7 +191,7 @@ class MetadataReplicationController(
                 throw e
             } catch (e: Exception) {
                 log.warn("metadata poll to {} failed; retrying after backoff: {}",
-                    peerAlias, e.message)
+                    remoteAlias, e.message)
                 delay(notPrimaryBackoff.millis)
                 continue
             }
@@ -223,7 +211,7 @@ class MetadataReplicationController(
             val primaryIntent = ReplicationIntent.Reader.from(primaryState.metadata)
             if (primaryIntent == null || !primaryIntent.isPrimary) {
                 log.warn("peer {} is not primary (intent={}); backoff",
-                    peerAlias, primaryIntent?.role)
+                    remoteAlias, primaryIntent?.role)
                 delay(notPrimaryBackoff.millis)
                 continue
             }
@@ -231,7 +219,7 @@ class MetadataReplicationController(
             val primaryVersion = primaryState.metadata.version()
             if (primaryVersion < lastAppliedMetadataVersion) {
                 log.warn("peer {} metadata_version regressed ({} < {}); full resync",
-                    peerAlias, primaryVersion, lastAppliedMetadataVersion)
+                    remoteAlias, primaryVersion, lastAppliedMetadataVersion)
                 lastAppliedMetadataVersion = 0L
                 continue
             }

@@ -129,7 +129,7 @@ class PerNodeReconciler(
         for ((followerShardId, d) in desired) {
             if (workers.containsKey(followerShardId)) continue
             val worker = ShardWorker(
-                leaderAlias = intent.peerClusterAlias,
+                leaderAlias = intent.remoteAlias,
                 leaderIndexName = d.leaderIndexName,
                 followerShardId = followerShardId,
                 client = client,

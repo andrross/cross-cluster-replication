@@ -72,13 +72,17 @@ import org.opensearch.replication.task.shard.ShardReplicationExecutor
 import org.opensearch.replication.task.shard.ShardReplicationParams
 import org.opensearch.replication.task.shard.ShardReplicationState
 import org.opensearch.replication.util.Injectables
+import org.opensearch.replication.v2.BootstrapOrchestrator
 import org.opensearch.replication.v2.MetadataReplicationController
 import org.opensearch.replication.v2.ReplicationIntent
 import org.opensearch.replication.v2.action.PutReplicationIntentAction
 import org.opensearch.replication.v2.action.TransportPutReplicationIntentAction
+import org.opensearch.replication.v2.action.status.GetReplicationStatusAction
+import org.opensearch.replication.v2.action.status.TransportGetReplicationStatusAction
 import org.opensearch.replication.v2.metadata.handlers.CoreHandlers
 import org.opensearch.replication.v2.reconciler.PerNodeReconciler
-import org.opensearch.replication.rest.PutReplicationIntentHandler
+import org.opensearch.replication.rest.ClusterReplicationStatusHandler
+import org.opensearch.replication.rest.ReplicationIntentHandler
 import org.opensearch.action.ActionRequest
 import org.opensearch.core.action.ActionResponse
 import org.opensearch.transport.client.Client
@@ -233,11 +237,13 @@ internal class ReplicationPlugin : Plugin(), ActionPlugin, PersistentTaskPlugin,
                 ReplicationMetadataStore(client, clusterService, xContentRegistry))
         this.replicationSettings = ReplicationSettings(clusterService)
 
+        val v2Bootstrap = BootstrapOrchestrator(clusterService, client, replicationMetadataManager)
         val v2MetadataController = MetadataReplicationController(
             clusterService,
             client,
             CoreHandlers.defaultRegistry(client),
-            replicationMetadataManager
+            replicationMetadataManager,
+            v2Bootstrap
         )
         val v2Reconciler = PerNodeReconciler(clusterService, client, threadPool)
 
@@ -246,6 +252,7 @@ internal class ReplicationPlugin : Plugin(), ActionPlugin, PersistentTaskPlugin,
             replicationMetadataManager,
             replicationSettings,
             followerClusterStats,
+            v2Bootstrap,
             v2MetadataController,
             v2Reconciler
         )
@@ -281,7 +288,8 @@ internal class ReplicationPlugin : Plugin(), ActionPlugin, PersistentTaskPlugin,
             ActionHandler(LeaderStatsAction.INSTANCE, TransportLeaderStatsAction::class.java),
             ActionHandler(FollowerStatsAction.INSTANCE, TransportFollowerStatsAction::class.java),
             ActionHandler(AutoFollowStatsAction.INSTANCE, TransportAutoFollowStatsAction::class.java),
-            ActionHandler(PutReplicationIntentAction.INSTANCE, TransportPutReplicationIntentAction::class.java)
+            ActionHandler(PutReplicationIntentAction.INSTANCE, TransportPutReplicationIntentAction::class.java),
+            ActionHandler(GetReplicationStatusAction.INSTANCE, TransportGetReplicationStatusAction::class.java)
         )
     }
 
@@ -300,7 +308,8 @@ internal class ReplicationPlugin : Plugin(), ActionPlugin, PersistentTaskPlugin,
             LeaderStatsHandler(),
             FollowerStatsHandler(),
             AutoFollowStatsHandler(),
-            PutReplicationIntentHandler())
+            ReplicationIntentHandler(clusterService),
+            ClusterReplicationStatusHandler())
     }
 
     override fun getExecutorBuilders(settings: Settings): List<ExecutorBuilder<*>> {
