@@ -40,7 +40,7 @@ import java.util.EnumSet
  *   - remoteAlias — the peer cluster's label. On the SECONDARY this must match an existing
  *     `cluster.remote.<remoteAlias>` setting; on the PRIMARY it is cosmetic.
  *   - role — PRIMARY or SECONDARY. Flips on switchover or failover.
- *   - status — STEADY, SWITCHING, or FAILED_OVER.
+ *   - phase — STEADY, SWITCHING, or FAILED_OVER.
  *   - epoch — relationship-generation counter. Bumps exactly once per role flip.
  */
 data class ReplicationIntent(
@@ -49,12 +49,12 @@ data class ReplicationIntent(
     val remoteAlias: String,
     val role: Role,
     val epoch: Long,
-    val status: Status
+    val phase: Phase
 ) : AbstractNamedDiffable<Metadata.Custom>(), Metadata.Custom {
 
     enum class Role { PRIMARY, SECONDARY }
 
-    enum class Status { STEADY, SWITCHING, FAILED_OVER }
+    enum class Phase { STEADY, SWITCHING, FAILED_OVER }
 
     companion object {
         const val NAME = "replication_intent"
@@ -64,7 +64,7 @@ data class ReplicationIntent(
         private const val FIELD_REMOTE_ALIAS = "remote_alias"
         private const val FIELD_ROLE = "role"
         private const val FIELD_EPOCH = "epoch"
-        private const val FIELD_STATUS = "status"
+        private const val FIELD_PHASE = "phase"
 
         fun readDiffFrom(inp: StreamInput): NamedDiff<Metadata.Custom> =
             readDiffFrom(Metadata.Custom::class.java, NAME, inp)
@@ -75,7 +75,7 @@ data class ReplicationIntent(
             var remoteAlias: String? = null
             var role: Role? = null
             var epoch: Long = 0L
-            var status: Status = Status.STEADY
+            var phase: Phase = Phase.STEADY
 
             if (parser.currentToken() == null) parser.nextToken()
             require(parser.currentToken() == XContentParser.Token.START_OBJECT) {
@@ -92,13 +92,13 @@ data class ReplicationIntent(
                     FIELD_REMOTE_ALIAS -> remoteAlias = parser.text()
                     FIELD_ROLE -> role = Role.valueOf(parser.text().uppercase())
                     FIELD_EPOCH -> epoch = parser.longValue()
-                    FIELD_STATUS -> status = Status.valueOf(parser.text().uppercase())
+                    FIELD_PHASE -> phase = Phase.valueOf(parser.text().uppercase())
                 }
             }
             require(relationshipId != null && localAlias != null && remoteAlias != null && role != null) {
                 "replication intent requires $FIELD_RELATIONSHIP_ID, $FIELD_LOCAL_ALIAS, $FIELD_REMOTE_ALIAS, $FIELD_ROLE"
             }
-            return ReplicationIntent(relationshipId, localAlias, remoteAlias, role, epoch, status)
+            return ReplicationIntent(relationshipId, localAlias, remoteAlias, role, epoch, phase)
         }
     }
 
@@ -108,7 +108,7 @@ data class ReplicationIntent(
         remoteAlias = inp.readString(),
         role = Role.valueOf(inp.readString()),
         epoch = inp.readLong(),
-        status = Status.valueOf(inp.readString())
+        phase = Phase.valueOf(inp.readString())
     )
 
     override fun writeTo(out: StreamOutput) {
@@ -117,7 +117,7 @@ data class ReplicationIntent(
         out.writeString(remoteAlias)
         out.writeString(role.name)
         out.writeLong(epoch)
-        out.writeString(status.name)
+        out.writeString(phase.name)
     }
 
     override fun getWriteableName(): String = NAME
@@ -130,7 +130,7 @@ data class ReplicationIntent(
         builder.field(FIELD_REMOTE_ALIAS, remoteAlias)
         builder.field(FIELD_ROLE, role.name)
         builder.field(FIELD_EPOCH, epoch)
-        builder.field(FIELD_STATUS, status.name)
+        builder.field(FIELD_PHASE, phase.name)
         return builder
     }
 

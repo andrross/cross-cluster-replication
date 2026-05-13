@@ -54,6 +54,10 @@ class TransportPutReplicationIntentAction @Inject constructor(
     { inp -> PutReplicationIntentRequest(inp) }, indexNameExpressionResolver
 ) {
 
+    // Capture for the auto-install pre-flight; the parent class holds its own copy but it
+    // isn't directly accessible from Kotlin.
+    private val remoteClusterService = transportService.remoteClusterService
+
     companion object {
         private val log = LogManager.getLogger(TransportPutReplicationIntentAction::class.java)
     }
@@ -118,11 +122,19 @@ class TransportPutReplicationIntentAction @Inject constructor(
         // on the peer cluster via the same transport action, then install locally. Peers
         // that already have a matching intent no-op. This keeps the two sides symmetric
         // without making the caller issue two PUTs.
-        //
-        // If `cluster.remote.<remoteAlias>.seeds` is not configured, `getRemoteClusterClient`
-        // will throw; we propagate that error to the caller as-is.
         if (!request.clear && request.role == ReplicationIntent.Role.SECONDARY) {
             val remoteAlias = request.remoteAlias!!
+            // Pre-flight: the auto-install hop needs a configured remote-cluster connection.
+            // Without this check, getRemoteClusterClient throws with an internal-sounding
+            // error; instead we return 400 with an actionable message before any side effects.
+            if (remoteAlias !in remoteClusterService.registeredRemoteClusterNames) {
+                listener.onFailure(OpenSearchStatusException(
+                    "remote cluster [$remoteAlias] is not configured; set " +
+                        "`cluster.remote.$remoteAlias.seeds` before issuing this PUT",
+                    RestStatus.BAD_REQUEST
+                ))
+                return
+            }
             scope.launch {
                 try {
                     installPrimaryOnPeer(request)
@@ -158,7 +170,7 @@ class TransportPutReplicationIntentAction @Inject constructor(
             it.localAlias = secondaryRequest.remoteAlias
             it.remoteAlias = secondaryRequest.localAlias
             it.epoch = secondaryRequest.epoch
-            it.status = secondaryRequest.status
+            it.phase = secondaryRequest.phase
         }
         val remoteClient = client.getRemoteClusterClient(secondaryRequest.remoteAlias!!)
         remoteClient.suspendExecute(
@@ -184,7 +196,7 @@ class TransportPutReplicationIntentAction @Inject constructor(
                     remoteAlias = request.remoteAlias!!,
                     role = request.role!!,
                     epoch = request.epoch,
-                    status = request.status
+                    phase = request.phase
                 )
                 metadataBuilder.putCustom(ReplicationIntent.NAME, intent)
             }

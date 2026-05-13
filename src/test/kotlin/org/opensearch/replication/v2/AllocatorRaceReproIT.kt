@@ -28,6 +28,9 @@ import java.util.concurrent.TimeUnit
 
 private const val L = "leaderCluster"
 private const val F = "followCluster"
+private const val REL = "repro-rel"
+private const val REMOTE_ALIAS = "source"
+private const val FOLLOWER_LOCAL_ALIAS = "follower"
 
 /**
  * Minimal reproduction for the PrimaryShardAllocator assertion crash observed when intent is
@@ -47,10 +50,9 @@ class AllocatorRaceReproIT : MultiClusterRestTestCase() {
 
     fun `test repro - intent set before leader index exists`() {
         val leader = getClientForCluster(L)
-        createConnectionBetweenClusters(F, L, connectionName = "source")
+        createConnectionBetweenClusters(F, L, connectionName = REMOTE_ALIAS)
 
-        putIntent(L, F, "PRIMARY")
-        putIntent(F, "source", "SECONDARY")
+        putSecondaryIntent()
 
         val name = "repro-${randomAlphaOfLength(6).lowercase(Locale.ROOT)}"
         leader.indices().create(CreateIndexRequest(name), RequestOptions.DEFAULT)
@@ -64,26 +66,24 @@ class AllocatorRaceReproIT : MultiClusterRestTestCase() {
 
     fun `test repro - prior restore then intent-first again`() {
         val leader = getClientForCluster(L)
-        createConnectionBetweenClusters(F, L, connectionName = "source")
+        createConnectionBetweenClusters(F, L, connectionName = REMOTE_ALIAS)
 
         // Phase 1: index-first pattern (known-good)
         val a = "repro-a-${randomAlphaOfLength(6).lowercase(Locale.ROOT)}"
         leader.indices().create(CreateIndexRequest(a), RequestOptions.DEFAULT)
         leader.index(IndexRequest(a).id("1").source(mapOf("k" to "a")), RequestOptions.DEFAULT)
 
-        putIntent(L, F, "PRIMARY")
-        putIntent(F, "source", "SECONDARY")
+        putSecondaryIntent()
 
         Thread.sleep(8_000)
 
         // Clear intent — this is what happens between tests in the suite.
-        clearIntent(F, "source")
-        clearIntent(L, F)
+        clearIntent(F)
+        clearIntent(L)
         Thread.sleep(2_000)
 
         // Phase 2: intent-first pattern (crash candidate)
-        putIntent(L, F, "PRIMARY")
-        putIntent(F, "source", "SECONDARY")
+        putSecondaryIntent()
         Thread.sleep(1_000)
 
         val b = "repro-b-${randomAlphaOfLength(6).lowercase(Locale.ROOT)}"
@@ -96,15 +96,25 @@ class AllocatorRaceReproIT : MultiClusterRestTestCase() {
         assertThat(resp.statusLine.statusCode).isEqualTo(200)
     }
 
-    private fun putIntent(cluster: String, peer: String, role: String) {
-        val body = """{"role":"$role","epoch":1,"status":"STEADY"}"""
-        val req = Request("PUT", "/_replication/cluster/$peer")
+    /**
+     * Issue the SECONDARY-side PUT against the follower cluster; the handler auto-installs the
+     * mirrored PRIMARY intent on the leader.
+     */
+    private fun putSecondaryIntent() {
+        val body = """{
+            |"role":"SECONDARY",
+            |"local_alias":"$FOLLOWER_LOCAL_ALIAS",
+            |"remote_alias":"$REMOTE_ALIAS",
+            |"epoch":1,
+            |"phase":"STEADY"
+            |}""".trimMargin()
+        val req = Request("PUT", "/_replication/cluster/$REL")
         req.entity = StringEntity(body, ContentType.APPLICATION_JSON)
-        getNamedCluster(cluster).lowLevelClient.performRequest(req)
+        getNamedCluster(F).lowLevelClient.performRequest(req)
     }
 
-    private fun clearIntent(cluster: String, peer: String) {
-        val req = Request("DELETE", "/_replication/cluster/$peer")
+    private fun clearIntent(cluster: String) {
+        val req = Request("DELETE", "/_replication/cluster/$REL")
         getNamedCluster(cluster).lowLevelClient.performRequest(req)
     }
 }

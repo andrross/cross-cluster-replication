@@ -1,6 +1,16 @@
 <!-- @formatter:off -->
 # Full-cluster replication: implementation overview
 
+Replication intent and replication status are architecturally distinct and should be
+stored differently. Intent is what the system has been told to do, changed only on
+deliberate action by an operator or an external control plane. Status is what the
+system is currently doing and is changed continuously by controllers and workers as
+they observe their own behavior. These two kinds of data are authored by different
+actors and change at rates separated by orders of magnitude: intent changes infrequently,
+while status can change many times per second per shard. A key tenet of this design is
+to avoid O(index count) or O(shard count) operations to cluster state when intent changes
+(i.e. avoid tracking status in any cluster state-based structure).
+
 ## API surface
 
 The intent document is a `Metadata.Custom` in cluster state (could be a system index too).
@@ -36,7 +46,7 @@ GET /_replication/cluster/<relationship-id>
   "local_alias": "...",
   "remote_alias": "...",
   "epoch": N,
-  "status": "STEADY"
+  "phase": "STEADY"
 }
 ```
 
@@ -137,7 +147,7 @@ Data-plane replication after bootstrap runs as in-memory coroutines on data node
 
 ## Observability
 
-- cluster replication status: e.g. current intent (peer, role, epoch, status), metadata controller state (running,
+- cluster replication status: e.g. current intent (relationship_id, role, local/remote aliases, epoch, phase), metadata controller state (running,
   last_applied_metadata_version, peer's current version, lag), shard-worker summary (per node: N running, N dead, N backing-off), bootstrap summary (in-flight
   restores, quarantined indices).
 - per-shard state (leader/follower shard IDs, last seqno pulled, last seqno replayed, lag,

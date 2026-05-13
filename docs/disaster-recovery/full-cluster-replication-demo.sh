@@ -125,7 +125,7 @@ cluster_state_summary() {
   )"
   local intent_summary="(none)"
   if [[ "$intent" == "200" ]]; then
-    intent_summary="$(jq -rc '{role,status,epoch,local_alias,remote_alias}' /tmp/fcr_demo_intent 2>/dev/null || cat /tmp/fcr_demo_intent)"
+    intent_summary="$(jq -rc '{role,phase,epoch,local_alias,remote_alias}' /tmp/fcr_demo_intent 2>/dev/null || cat /tmp/fcr_demo_intent)"
   fi
   printf '  [%s] index=%s docs=%s intent=%s\n' \
     "$label" "$has_index" "$count" "$intent_summary"
@@ -197,7 +197,7 @@ step "Installing SECONDARY intent on follower (leader PRIMARY is auto-installed)
 # cluster.remote.$REMOTE_ALIAS connection and installs the mirrored PRIMARY intent
 # (with local_alias/remote_alias swapped) on the leader.
 curl -sS -XPUT "http://$FOLLOWER/_replication/cluster/$RELATIONSHIP_ID" -H 'Content-Type: application/json' \
-  -d "{\"role\":\"SECONDARY\",\"local_alias\":\"$FOLLOWER_LOCAL_ALIAS\",\"remote_alias\":\"$REMOTE_ALIAS\",\"epoch\":1,\"status\":\"STEADY\"}" | pretty
+  -d "{\"role\":\"SECONDARY\",\"local_alias\":\"$FOLLOWER_LOCAL_ALIAS\",\"remote_alias\":\"$REMOTE_ALIAS\",\"epoch\":1,\"phase\":\"STEADY\"}" | pretty
 
 step "Confirm GET returns the intents"
 log "leader intent:"
@@ -282,8 +282,10 @@ else
 fi
 
 step "Write a fresh document on the former secondary to prove it's writable"
+# Use field names that don't conflict with the dynamic mapping inferred from the earlier
+# replicated docs (`n` is mapped as long).
 curl -sS -XPOST "http://$FOLLOWER/$INDEX_NAME/_doc" -H 'Content-Type: application/json' \
-  -d '{"n":"post-sever","phase":"independent"}' | pretty
+  -d '{"phase":"post-sever","note":"written-on-former-secondary"}' | pretty
 curl -sS -XPOST "http://$FOLLOWER/$INDEX_NAME/_refresh" > /dev/null
 log "follower doc count after write: $(doc_count "$FOLLOWER") (expected $((DOC_COUNT + 1)))"
 

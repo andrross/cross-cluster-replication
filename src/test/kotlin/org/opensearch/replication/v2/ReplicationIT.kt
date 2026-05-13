@@ -290,7 +290,7 @@ class ReplicationIT : MultiClusterRestTestCase() {
         assertThat(body["remote_alias"]).isEqualTo(REMOTE_ALIAS)
         assertThat(body["role"]).isEqualTo("SECONDARY")
         assertThat((body["epoch"] as Number).toLong()).isEqualTo(1L)
-        assertThat(body["status"]).isEqualTo("STEADY")
+        assertThat(body["phase"]).isEqualTo("STEADY")
 
         // Auto-install writes the mirrored PRIMARY intent on the leader.
         val (leaderStatus, leaderBody) = getReplicationIntent(LEADER, RELATIONSHIP_ID)
@@ -569,7 +569,7 @@ class ReplicationIT : MultiClusterRestTestCase() {
             |"local_alias":"$FOLLOWER_LOCAL_ALIAS",
             |"remote_alias":"$REMOTE_ALIAS",
             |"epoch":1,
-            |"status":"STEADY"
+            |"phase":"STEADY"
             |}""".trimMargin()
         val req = Request("PUT", "/_replication/cluster/$relationshipId")
         req.entity = StringEntity(body, ContentType.APPLICATION_JSON)

@@ -23,7 +23,7 @@ import org.opensearch.replication.v2.ReplicationIntent
  * Transport request for PutReplicationIntentAction.
  *
  * The relationship ID is part of the URL and set by the REST handler, not carried in the
- * request body. The body carries role/local_alias/remote_alias/epoch/status.
+ * request body. The body carries role/local_alias/remote_alias/epoch/phase.
  *
  *   PUT /_replication/cluster/{relationship_id}
  *   {
@@ -31,7 +31,7 @@ import org.opensearch.replication.v2.ReplicationIntent
  *     "local_alias": "us-east-1",
  *     "remote_alias": "us-west-2",
  *     "epoch": 1,
- *     "status": "STEADY"
+ *     "phase": "STEADY"
  *   }
  *
  *   DELETE /_replication/cluster/{relationship_id}
@@ -47,7 +47,7 @@ class PutReplicationIntentRequest : AcknowledgedRequest<PutReplicationIntentRequ
     var remoteAlias: String? = null
     var role: ReplicationIntent.Role? = null
     var epoch: Long = 0L
-    var status: ReplicationIntent.Status = ReplicationIntent.Status.STEADY
+    var phase: ReplicationIntent.Phase = ReplicationIntent.Phase.STEADY
 
     constructor() : super()
 
@@ -59,7 +59,7 @@ class PutReplicationIntentRequest : AcknowledgedRequest<PutReplicationIntentRequ
         val roleName = inp.readOptionalString()
         role = roleName?.let { ReplicationIntent.Role.valueOf(it) }
         epoch = inp.readLong()
-        status = ReplicationIntent.Status.valueOf(inp.readString())
+        phase = ReplicationIntent.Phase.valueOf(inp.readString())
     }
 
     override fun writeTo(out: StreamOutput) {
@@ -70,7 +70,7 @@ class PutReplicationIntentRequest : AcknowledgedRequest<PutReplicationIntentRequ
         out.writeOptionalString(remoteAlias)
         out.writeOptionalString(role?.name)
         out.writeLong(epoch)
-        out.writeString(status.name)
+        out.writeString(phase.name)
     }
 
     override fun validate(): ActionRequestValidationException? {
@@ -97,7 +97,7 @@ class PutReplicationIntentRequest : AcknowledgedRequest<PutReplicationIntentRequ
         private const val FIELD_LOCAL_ALIAS = "local_alias"
         private const val FIELD_REMOTE_ALIAS = "remote_alias"
         private const val FIELD_EPOCH = "epoch"
-        private const val FIELD_STATUS = "status"
+        private const val FIELD_PHASE = "phase"
 
         /**
          * Parse the body of a PUT. The relationship ID is not parsed from the body — the
@@ -120,7 +120,7 @@ class PutReplicationIntentRequest : AcknowledgedRequest<PutReplicationIntentRequ
                     FIELD_LOCAL_ALIAS -> req.localAlias = parser.text()
                     FIELD_REMOTE_ALIAS -> req.remoteAlias = parser.text()
                     FIELD_EPOCH -> req.epoch = parser.longValue()
-                    FIELD_STATUS -> req.status = ReplicationIntent.Status.valueOf(parser.text().uppercase())
+                    FIELD_PHASE -> req.phase = ReplicationIntent.Phase.valueOf(parser.text().uppercase())
                 }
             }
             return req

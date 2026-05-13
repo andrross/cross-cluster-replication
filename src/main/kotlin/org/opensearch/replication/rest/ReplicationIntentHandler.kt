@@ -39,7 +39,7 @@ import java.io.IOException
  *     "local_alias": "us-east-1",
  *     "remote_alias": "us-west-2",
  *     "epoch": 1,
- *     "status": "STEADY"
+ *     "phase": "STEADY"
  *   }
  * ```
  *
