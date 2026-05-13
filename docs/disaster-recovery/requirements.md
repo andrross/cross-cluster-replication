@@ -85,3 +85,5 @@ roles deliberately (switchover) or recover from a regional failure (failover/fai
    replication.
 2. **Three-or-more-region topologies.** One primary, one secondary. Future version may
    allow for multiple secondaries.
+3. **Compatibility with CCR.** The DR feature is a new API surface. It is not API-compatible
+   with CCR, and the two are not supported on the same cluster simultaneously.
