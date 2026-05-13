@@ -7,13 +7,15 @@ deliberate action by an operator or an external control plane. Status is what th
 system is currently doing and is changed continuously by controllers and workers as
 they observe their own behavior. These two kinds of data are authored by different
 actors and change at rates separated by orders of magnitude: intent changes infrequently,
-while status can change many times per second per shard. A key tenet of this design is
-to avoid O(index count) or O(shard count) operations to cluster state when intent changes
-(i.e. avoid tracking status in any cluster state-based structure).
+while status can change many times per second per shard.
+
+Key tenets of this design are that an intent change produces O(1) cluster-state writes
+regardless of how many indices or shards it affects, and that status is never written to
+cluster state.
 
 ## API surface
 
-The intent document is a `Metadata.Custom` in cluster state (could be a system index too).
+The intent document is a `Metadata.Custom` in cluster state.
 
 The URL parameter is a customer-chosen **relationship ID**. It identifies the
 replication relationship and is stable across its life. Both clusters record the
