@@ -105,7 +105,7 @@ import org.opensearch.env.Environment
 import org.opensearch.env.NodeEnvironment
 import org.opensearch.index.IndexModule
 import org.opensearch.index.IndexSettings
-import org.opensearch.index.engine.EngineFactory
+import org.opensearch.index.engine.PrimaryOperationPolicy
 import org.opensearch.index.translog.ReplicationTranslogDeletionPolicy
 import org.opensearch.index.translog.TranslogDeletionPolicyFactory
 import org.opensearch.indices.recovery.RecoverySettings
@@ -164,7 +164,6 @@ import org.opensearch.watcher.ResourceWatcherService
 import java.util.Optional
 import java.util.function.Supplier
 
-import org.opensearch.index.engine.NRTReplicationEngine
 import org.opensearch.indices.SystemIndexDescriptor
 import org.opensearch.replication.util.ValidationUtil
 
@@ -422,16 +421,9 @@ internal class ReplicationPlugin : Plugin(), ActionPlugin, PersistentTaskPlugin,
         return mapOf(REMOTE_REPOSITORY_TYPE to repoFactory)
     }
 
-    override fun getEngineFactory(indexSettings: IndexSettings): Optional<EngineFactory> {
+    override fun getPrimaryOperationPolicy(indexSettings: IndexSettings): Optional<PrimaryOperationPolicy> {
         return if (indexSettings.settings.get(REPLICATED_INDEX_SETTING.key) != null) {
-            Optional.of(EngineFactory { config ->
-                // Use NRTSegmentReplicationEngine for SEGMENT replication type indices replica shards
-                if (config.isReadOnlyReplica) {
-                    NRTReplicationEngine(config)
-                } else {
-                    ReplicationEngine(config)
-                }
-            })
+            Optional.of(FollowerPrimaryOperationPolicy)
         } else {
             Optional.empty()
         }
